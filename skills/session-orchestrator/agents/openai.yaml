@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Orchestrator"
+  short_description: "Coordinate parallel plan-first sessions from one spec"
+  default_prompt: "Use $session-orchestrator to split this change into parallel plan-first sessions, validate their plans against the code, and draft the GO texts for the owner."

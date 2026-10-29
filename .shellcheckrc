@@ -1,0 +1,4 @@
+shell=bash
+external-sources=true
+# Helpers are often called through wrappers such as run(); shellcheck cannot see those calls.
+disable=SC2119,SC2120

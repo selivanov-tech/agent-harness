@@ -1,0 +1,4 @@
+interface:
+  display_name: "Worktree Sessions"
+  short_description: "Work in your own git worktree next to parallel sessions"
+  default_prompt: "Use $worktree-sessions to set up my own worktree with wt, run the project gate there, and clean up with wt rm after the merge."

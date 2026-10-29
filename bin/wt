@@ -1,0 +1,1503 @@
+#!/usr/bin/env bash
+# wt: one git worktree per coding session, next to the main checkout.
+# Bash 3.2 compatible on purpose: macOS ships 3.2 and wt must run everywhere
+# without extra installs.
+set -eEuo pipefail
+
+WT_VERSION=0.1.0
+
+E_INTERNAL=1
+E_USAGE=2
+E_REFUSED=3
+E_FINDINGS=4
+E_HOOK=5
+
+SLUG_RE='^[a-z0-9]([a-z0-9-]{0,42}[a-z0-9])?$'
+PREFIX_RE='^[a-z0-9][a-z0-9_-]*$'
+CONF_KEY_RE='^[a-z_]+$'
+CONF_KEYS="clone copy materialize teardown stack_prefix stack_budget idle_days worktree_dir"
+
+WT_DYING=0
+WT_ERR_LINE="?"
+
+usage() {
+  cat <<EOF
+wt $WT_VERSION: one git worktree per session, next to the main checkout.
+
+Usage:
+  wt new <slug> [--from <ref>] [--branch <name>] [--sync] [--no-hooks]
+  wt ls [--json]
+  wt path <slug>
+  wt adopt <dir> <slug>
+  wt rm <slug> [--force] [--drop-data] [--keep-branch] [--no-hooks]
+  wt doctor [--json] [--idle-days <n>]
+  wt help
+  wt version
+
+Commands:
+  new     Create or reuse <parent>/.wt-<repo>-<slug> on branch <slug>, branched
+          from the local default branch, then materialize it from .wt.conf.
+  ls      List linked worktrees: slug, branch, ahead/behind, dirty, PR, stack.
+  path    Print the path of the worktree with this slug.
+  adopt   Give a slug to a worktree made by hand or by an agent harness.
+  rm      Run the teardown hook, then remove the worktree and its local branch.
+          Refuses local changes, unmerged commits and open PRs without --force;
+          refuses locked worktrees and slugs shared by several worktrees.
+  doctor  Read-only check: shadow refs, stale registrations, unadopted
+          worktrees, cleanup candidates, stack budget, orphan stacks, volumes.
+
+Options:
+  --from <ref>      new: start point, a local branch, tag or commit
+  --branch <name>   new: branch name when it should differ from the slug
+  --sync            new: fetch origin and fast-forward the default branch in
+                    the main checkout before branching
+  --no-hooks        new, rm: skip the materialize or teardown hook
+  --force           rm: remove despite local changes, unmerged commits, an open
+                    PR or submodules; with the directory already gone, run the
+                    teardown hook from the main checkout
+  --drop-data       rm: run the teardown hook with WT_DROP_DATA=1
+  --keep-branch     rm: keep the local branch
+  --json            ls, doctor: machine-readable output
+  --idle-days <n>   doctor: idle days before a merged worktree is a cleanup
+                    candidate (default: idle_days from .wt.conf, else 7)
+
+A slug is 1-44 lowercase letters, digits and inner dashes, and is not the name
+of the default branch. The branch is the slug unless --branch says otherwise.
+
+.wt.conf at the repository root (KEY=VALUE lines, # comments, no expansion):
+  clone=<paths>        directories cloned from the main checkout, copy-on-write
+                       where the filesystem supports it (vendor node_modules)
+  copy=<paths>         files copied from the main checkout when the worktree
+                       has none; never overwritten (.env)
+  materialize=<cmd>    run by wt new inside the worktree after clone and copy
+  teardown=<cmd>       run by wt rm before removal, inside the worktree (in the
+                       main checkout when the directory is already gone)
+  stack_prefix=<name>  compose project prefix: the stack of <slug> is
+                       <prefix><slug>
+  stack_budget=<n>     how many <prefix>* stacks may run at once (doctor)
+  idle_days=<n>        default for doctor --idle-days
+  worktree_dir=<dir>   parent directory for worktrees, absolute or relative to
+                       the main checkout (default: the main checkout's parent)
+clone, copy, materialize and teardown come from the worktree's own .wt.conf
+when it has one, so a branch can change them before it is merged.
+
+Hooks run with bash -c and get WT_SLUG, WT_DIR, WT_ROOT (the main checkout),
+WT_BRANCH and WT_DROP_DATA (0 or 1). A teardown hook must take the slug from
+WT_SLUG, never from the directory it runs in: when the worktree is gone it runs
+in the main checkout. wt prints every hook command before it runs it, and says
+so when the worktree's .wt.conf differs from the main checkout's. Hooks run
+with your rights, like make in that worktree: use wt only with branches you trust.
+
+Environment:
+  WT_HOME         parent directory for worktrees (overrides worktree_dir)
+  WT_NO_GH=1      never call gh (PR state is then unknown)
+  WT_NO_DOCKER=1  never call docker (stack state is then unknown)
+  WT_VERBOSE=1    print the git commands that change state
+
+Exit codes:
+  0  success; for doctor: nothing to act on
+  1  internal or git error
+  2  bad usage or validation error
+  3  refused by a safety check (the message says whether --force applies)
+  4  doctor found something to act on
+  5  a hook failed; the worktree is kept and running the command again is safe
+EOF
+}
+
+say() {
+  printf 'wt: %s\n' "$*" >&2
+}
+
+die() {
+  local code=$1
+  shift
+  printf 'wt: %s\n' "$*" >&2
+  WT_DYING=1
+  exit "$code"
+}
+
+on_exit() {
+  local rc=$1
+  if [ "$rc" -ne 0 ] && [ "$WT_DYING" != 1 ]; then
+    printf 'wt: unexpected failure (exit %s) near line %s\n' "$rc" "$WT_ERR_LINE" >&2
+    exit "$E_INTERNAL"
+  fi
+}
+
+trap 'WT_ERR_LINE=$LINENO' ERR
+trap 'on_exit $?' EXIT
+
+git_do() {
+  if [ "${WT_VERBOSE:-}" = 1 ]; then
+    say "+ git $*"
+  fi
+  git "$@"
+}
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+split_words() {
+  WORDS=()
+  if [ -n "$1" ]; then
+    read -r -a WORDS <<<"$1"
+  fi
+}
+
+need_value() {
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    die "$E_USAGE" "$1 needs a value"
+  fi
+}
+
+json_str() {
+  local s=$1 out="" c i
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  if [[ $s == *[[:cntrl:]]* ]]; then
+    for ((i = 0; i < ${#s}; i++)); do
+      c=${s:i:1}
+      case $c in
+        [[:cntrl:]]) out+=$(printf '\\u%04x' "'$c") ;;
+        *) out+=$c ;;
+      esac
+    done
+    s=$out
+  fi
+  printf '"%s"' "$s"
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+json_str_or_null() {
+  if [ -n "$1" ]; then
+    json_str "$1"
+  else
+    printf 'null'
+  fi
+}
+
+json_num_or_null() {
+  if [ -n "$1" ]; then
+    printf '%s' "$1"
+  else
+    printf 'null'
+  fi
+}
+
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
+}
+
+# real_dir <path>: the physical path of an existing directory, else the path as
+# given. Git may register a worktree under a path that goes through a symlink.
+real_dir() {
+  if [ -d "$1" ]; then
+    (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# --- configuration -----------------------------------------------------------
+
+safe_rel_path() {
+  case $1 in
+    '' | /* | . | .. | ../* | */.. | */../* | .git | .git/* | */.git | */.git/*) return 1 ;;
+  esac
+  return 0
+}
+
+check_conf() {
+  local file=$1 prefix=$2 name var entry
+  for name in stack_budget idle_days; do
+    var="${prefix}_${name}"
+    case ${!var} in
+      '') ;;
+      *[!0-9]*) die "$E_USAGE" "$file: $name must be a whole number, got '${!var}'" ;;
+      *) printf -v "$var" '%s' "$((10#${!var}))" ;;
+    esac
+  done
+  var="${prefix}_stack_prefix"
+  if [ -n "${!var}" ] && ! [[ ${!var} =~ $PREFIX_RE ]]; then
+    die "$E_USAGE" "$file: stack_prefix '${!var}' may use lowercase letters, digits, '-' and '_'"
+  fi
+  for name in clone copy; do
+    var="${prefix}_${name}"
+    split_words "${!var}"
+    for entry in ${WORDS[@]+"${WORDS[@]}"}; do
+      if ! safe_rel_path "$entry"; then
+        die "$E_USAGE" "$file: $name entry '$entry' must be a relative path inside the repository"
+      fi
+    done
+  done
+}
+
+# read_conf <file> <prefix>: sets <prefix>_<key> for every known key.
+read_conf() {
+  local file=$1 prefix=$2 key line value n=0
+  for key in $CONF_KEYS; do
+    printf -v "${prefix}_${key}" '%s' ""
+  done
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=$(trim "${line%$'\r'}")
+    case $line in
+      '' | '#'*) continue ;;
+      *=*) ;;
+      *) die "$E_USAGE" "$file:$n: expected KEY=VALUE, got '$line'" ;;
+    esac
+    key=$(trim "${line%%=*}")
+    value=$(trim "${line#*=}")
+    if [[ $key =~ $CONF_KEY_RE ]] && [[ " $CONF_KEYS " == *" $key "* ]]; then
+      printf -v "${prefix}_${key}" '%s' "$value"
+    else
+      say "$file:$n: unknown key '$key' ignored"
+    fi
+  done <"$file"
+  check_conf "$file" "$prefix"
+}
+
+# load_wt_conf <dir>: per-worktree settings, from the worktree's own .wt.conf
+# when present, else from the main checkout.
+load_wt_conf() {
+  WTC_NOTE=""
+  if [ -f "$1/.wt.conf" ]; then
+    read_conf "$1/.wt.conf" WTC
+    if [ ! -f "$MAIN_ROOT/.wt.conf" ]; then
+      WTC_NOTE="the main checkout has no .wt.conf; the hook comes from $1/.wt.conf (this worktree's branch)"
+    elif ! cmp -s "$1/.wt.conf" "$MAIN_ROOT/.wt.conf"; then
+      WTC_NOTE="$1/.wt.conf differs from the main checkout's; the hook comes from this worktree's branch"
+    fi
+  else
+    read_conf "$MAIN_ROOT/.wt.conf" WTC
+  fi
+}
+
+# --- repository discovery ----------------------------------------------------
+
+load_worktrees() {
+  WTS_PATH=()
+  WTS_BRANCH=()
+  WTS_HEAD=()
+  WTS_BARE=()
+  WTS_LOCKED=()
+  local line n=-1
+  while IFS= read -r line; do
+    case $line in
+      "worktree "*)
+        n=$((n + 1))
+        WTS_PATH[n]=${line#worktree }
+        WTS_BRANCH[n]=""
+        WTS_HEAD[n]=""
+        WTS_BARE[n]=0
+        WTS_LOCKED[n]=0
+        ;;
+      "HEAD "*) WTS_HEAD[n]=${line#HEAD } ;;
+      "branch refs/heads/"*) WTS_BRANCH[n]=${line#branch refs/heads/} ;;
+      bare) WTS_BARE[n]=1 ;;
+      locked | "locked "*) WTS_LOCKED[n]=1 ;;
+    esac
+  done < <(git -C "$1" worktree list --porcelain)
+  WTS_COUNT=$((n + 1))
+}
+
+# admin_dir_of <worktree path>: prints $GIT_COMMON_DIR/worktrees/<id>, also for
+# a worktree whose directory is gone. The gitdir file there holds an absolute
+# path or, with worktree.useRelativePaths, one relative to the admin directory.
+admin_dir_of() {
+  local dir=$1 d target parent
+  if [ -d "$dir" ]; then
+    git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null
+    return
+  fi
+  for d in "$COMMON_DIR"/worktrees/*/; do
+    if [ ! -f "${d}gitdir" ]; then
+      continue
+    fi
+    target=$(cat "${d}gitdir")
+    case $target in
+      /*) ;;
+      *)
+        parent=$(cd "$d" 2>/dev/null && cd "$(dirname "$(dirname "$target")")" 2>/dev/null && pwd -P) || continue
+        target="$parent/$(basename "$(dirname "$target")")/.git"
+        ;;
+    esac
+    if [ "$target" = "$dir/.git" ]; then
+      printf '%s' "${d%/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# load_slugs: the slug of every linked worktree. wt.slug counts only while
+# wt.path still names the worktree, because git worktree add copies the
+# config.worktree of the worktree it runs in. Otherwise the slug comes from a
+# .wt-<repo>-<slug> directory name, or there is none.
+load_slugs() {
+  WTS_SLUG=()
+  WTS_ADOPTED=()
+  WTS_ADMIN=()
+  WTS_OWN_BRANCH=()
+  WTS_COPIED_FROM=()
+  local i dir admin slug base key value conf_path own
+  for ((i = 0; i < WTS_COUNT; i++)); do
+    WTS_SLUG[i]=""
+    WTS_ADOPTED[i]=0
+    WTS_ADMIN[i]=""
+    WTS_OWN_BRANCH[i]=""
+    WTS_COPIED_FROM[i]=""
+    if [ "$i" -eq 0 ]; then
+      continue
+    fi
+    dir=${WTS_PATH[i]}
+    slug=""
+    conf_path=""
+    own=""
+    if admin=$(admin_dir_of "$dir"); then
+      WTS_ADMIN[i]=$admin
+      while read -r key value; do
+        case $key in
+          wt.slug) slug=$value ;;
+          wt.path) conf_path=$value ;;
+          wt.branch) own=$value ;;
+        esac
+      done < <(git config --file "$admin/config.worktree" --get-regexp '^wt\.' 2>/dev/null || true)
+      if [ -n "$slug" ] && [ -n "$conf_path" ] && [ "$conf_path" != "$dir" ] &&
+        [ "$(real_dir "$conf_path")" != "$(real_dir "$dir")" ]; then
+        WTS_COPIED_FROM[i]=$conf_path
+        slug=""
+      elif [ -n "$slug" ]; then
+        WTS_ADOPTED[i]=1
+        WTS_OWN_BRANCH[i]=$own
+      fi
+    fi
+    if [ -z "$slug" ]; then
+      base=${dir##*/}
+      case $base in
+        ".wt-$REPO_NAME-"*) slug=${base#".wt-$REPO_NAME-"} ;;
+      esac
+    fi
+    if [[ $slug =~ $SLUG_RE ]]; then
+      WTS_SLUG[i]=$slug
+    fi
+  done
+}
+
+detect_default_branch() {
+  local ref
+  if ref=$(git -C "$MAIN_ROOT" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
+    DEFAULT_BRANCH=${ref#refs/remotes/origin/}
+  elif git -C "$MAIN_ROOT" show-ref --verify --quiet refs/heads/main; then
+    DEFAULT_BRANCH=main
+  elif git -C "$MAIN_ROOT" show-ref --verify --quiet refs/heads/master; then
+    DEFAULT_BRANCH=master
+  else
+    DEFAULT_BRANCH=main
+  fi
+}
+
+find_repo() {
+  command -v git >/dev/null 2>&1 || die "$E_INTERNAL" "git is not installed"
+  if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null || true)" != true ]; then
+    die "$E_USAGE" "not inside a git working tree"
+  fi
+  load_worktrees .
+  if [ "$WTS_COUNT" -eq 0 ]; then
+    die "$E_INTERNAL" "git worktree list returned nothing"
+  fi
+  if [ "${WTS_BARE[0]}" = 1 ]; then
+    die "$E_USAGE" "bare repositories are not supported"
+  fi
+  MAIN_ROOT=${WTS_PATH[0]}
+  REPO_NAME=${MAIN_ROOT##*/}
+  COMMON_DIR=$(git -C "$MAIN_ROOT" rev-parse --git-common-dir)
+  case $COMMON_DIR in
+    /*) ;;
+    *) COMMON_DIR="$MAIN_ROOT/$COMMON_DIR" ;;
+  esac
+  COMMON_DIR=$(cd "$COMMON_DIR" && pwd -P)
+  REMOTES=()
+  local remote
+  while IFS= read -r remote; do
+    if [ -n "$remote" ]; then
+      REMOTES+=("$remote")
+    fi
+  done < <(git -C "$MAIN_ROOT" remote)
+  read_conf "$MAIN_ROOT/.wt.conf" REPO
+  detect_default_branch
+  load_slugs
+}
+
+# find_slug <slug>: FOUND = index of the first worktree with this slug,
+# FOUND_COUNT = how many have it; returns 1 when none has it.
+find_slug() {
+  local i
+  FOUND=-1
+  FOUND_COUNT=0
+  for ((i = 1; i < WTS_COUNT; i++)); do
+    if [ "${WTS_SLUG[i]}" = "$1" ]; then
+      FOUND_COUNT=$((FOUND_COUNT + 1))
+      if [ "$FOUND" -lt 0 ]; then
+        FOUND=$i
+      fi
+    fi
+  done
+  if [ "$FOUND" -lt 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+# find_unique_slug <slug>: find_slug, but a slug shared by several worktrees is
+# a safety refusal: acting on the first match could hit the wrong directory.
+find_unique_slug() {
+  local i list=""
+  if ! find_slug "$1"; then
+    die "$E_USAGE" "no worktree with slug '$1' (see wt ls)"
+  fi
+  if [ "$FOUND_COUNT" -gt 1 ]; then
+    for ((i = 1; i < WTS_COUNT; i++)); do
+      if [ "${WTS_SLUG[i]}" = "$1" ]; then
+        list="$list ${WTS_PATH[i]}"
+      fi
+    done
+    die "$E_REFUSED" "slug '$1' matches $FOUND_COUNT worktrees:$list. Give each its own slug with wt adopt <dir> <slug> first."
+  fi
+}
+
+# --- validation ----------------------------------------------------------------
+
+check_slug() {
+  if ! [[ $1 =~ $SLUG_RE ]]; then
+    die "$E_USAGE" "invalid slug '$1': use 1-44 lowercase letters, digits and inner dashes"
+  fi
+  case $1 in
+    main | master | "$DEFAULT_BRANCH")
+      die "$E_USAGE" "slug '$1' is reserved: it names a default branch"
+      ;;
+  esac
+}
+
+check_slug_format() {
+  if ! [[ $1 =~ $SLUG_RE ]]; then
+    die "$E_USAGE" "invalid slug '$1'"
+  fi
+}
+
+# Ref names are compared case-insensitively: on APFS a local Origin/main is the
+# same loose-ref file as origin/main and shadows the remote-tracking branch.
+check_branch_name() {
+  local branch=$1 low remote
+  low=$(lower "$branch")
+  case $branch in
+    -* | HEAD | */HEAD) die "$E_USAGE" "invalid branch name '$branch'" ;;
+  esac
+  case $low in
+    refs/*) die "$E_USAGE" "invalid branch name '$branch': a name starting with refs/ shadows other refs" ;;
+  esac
+  for remote in ${REMOTES[@]+"${REMOTES[@]}"}; do
+    if [ "$low" = "$(lower "$remote")" ]; then
+      die "$E_USAGE" "branch name '$branch' is also the name of a remote"
+    fi
+    case $low in
+      "$(lower "$remote")"/*)
+        die "$E_USAGE" "branch name '$branch' starts with the remote name '$remote/': git would create refs/heads/$branch, a local branch that shadows the remote-tracking branch. The branch is the slug by default; to start from the latest $remote/$DEFAULT_BRANCH run: wt new <slug> --sync"
+        ;;
+    esac
+  done
+  if ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+    die "$E_USAGE" "invalid branch name '$branch'"
+  fi
+  if [ "$branch" = "$DEFAULT_BRANCH" ]; then
+    die "$E_USAGE" "branch '$branch' is the default branch"
+  fi
+}
+
+check_from() {
+  local ref=$1 low remote remote_ref=0 full
+  local hint="wt branches only from local refs so the start point is explicit. For the latest origin/$DEFAULT_BRANCH run: wt new <slug> --sync. For another remote branch: git branch <name> <remote>/<branch>, then wt new <slug> --from <name>."
+  low=$(lower "$ref")
+  case $low in
+    -*) die "$E_USAGE" "invalid --from '$ref'" ;;
+    refs/remotes/* | remotes/* | *'@{u}'* | *'@{upstream}'* | *'@{push}'*) remote_ref=1 ;;
+  esac
+  for remote in ${REMOTES[@]+"${REMOTES[@]}"}; do
+    case $low in
+      "$(lower "$remote")" | "$(lower "$remote")"/*) remote_ref=1 ;;
+    esac
+  done
+  full=$(git -C "$MAIN_ROOT" rev-parse --symbolic-full-name "$ref" 2>/dev/null || true)
+  case $full in
+    refs/remotes/*) remote_ref=1 ;;
+  esac
+  if [ "$remote_ref" = 1 ]; then
+    die "$E_USAGE" "--from '$ref' is a remote-tracking ref. $hint"
+  fi
+  if ! git -C "$MAIN_ROOT" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+    die "$E_USAGE" "--from '$ref' does not name a commit"
+  fi
+}
+
+# --- helpers shared by commands ----------------------------------------------
+
+worktree_parent() {
+  local parent
+  if [ -n "${WT_HOME:-}" ]; then
+    parent=$WT_HOME
+  elif [ -n "$REPO_worktree_dir" ]; then
+    case $REPO_worktree_dir in
+      /*) parent=$REPO_worktree_dir ;;
+      *) parent="$MAIN_ROOT/$REPO_worktree_dir" ;;
+    esac
+  else
+    parent=$(dirname "$MAIN_ROOT")
+  fi
+  mkdir -p "$parent" || die "$E_INTERNAL" "cannot create $parent"
+  WT_PARENT=$(cd "$parent" && pwd -P)
+}
+
+# set_slug <dir> <slug> <branch>: records the slug, the path it belongs to and
+# the branch wt rm may delete.
+set_slug() {
+  local dir=$1 slug=$2 branch=$3
+  if [ "$(git -C "$MAIN_ROOT" config --bool --get extensions.worktreeConfig 2>/dev/null || true)" != true ]; then
+    git_do -C "$MAIN_ROOT" config extensions.worktreeConfig true || die "$E_INTERNAL" "cannot enable extensions.worktreeConfig"
+  fi
+  git_do -C "$dir" config --worktree wt.slug "$slug" || die "$E_INTERNAL" "cannot set wt.slug in $dir"
+  git_do -C "$dir" config --worktree wt.path "$dir" || die "$E_INTERNAL" "cannot set wt.path in $dir"
+  if [ -n "$branch" ]; then
+    git_do -C "$dir" config --worktree wt.branch "$branch" || die "$E_INTERNAL" "cannot set wt.branch in $dir"
+  else
+    git -C "$dir" config --worktree --unset wt.branch 2>/dev/null || true
+  fi
+}
+
+sync_default_branch() {
+  local current
+  if ! git -C "$MAIN_ROOT" remote get-url origin >/dev/null 2>&1; then
+    die "$E_USAGE" "--sync needs a remote named origin"
+  fi
+  current=$(git -C "$MAIN_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  if [ "$current" != "$DEFAULT_BRANCH" ]; then
+    die "$E_REFUSED" "--sync: the main checkout is on '${current:-a detached HEAD}', not '$DEFAULT_BRANCH'; switch it back or drop --sync"
+  fi
+  say "fetching origin and fast-forwarding $DEFAULT_BRANCH in $MAIN_ROOT"
+  GIT_TERMINAL_PROMPT=0 git_do -C "$MAIN_ROOT" fetch --quiet origin || die "$E_INTERNAL" "git fetch origin failed"
+  if ! git -C "$MAIN_ROOT" show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
+    die "$E_INTERNAL" "origin has no branch '$DEFAULT_BRANCH'"
+  fi
+  git_do -C "$MAIN_ROOT" merge --ff-only --quiet "refs/remotes/origin/$DEFAULT_BRANCH" ||
+    die "$E_INTERNAL" "cannot fast-forward $DEFAULT_BRANCH to origin/$DEFAULT_BRANCH (diverged history or conflicting local changes); fix it in $MAIN_ROOT"
+}
+
+clone_path() {
+  local src=$1 dst=$2
+  CLONE_MODE=copy-on-write
+  case $(uname -s) in
+    Darwin)
+      if cp -c -a "$src" "$dst" 2>/dev/null; then
+        return 0
+      fi
+      ;;
+    Linux)
+      if cp -a --reflink=auto "$src" "$dst" 2>/dev/null; then
+        return 0
+      fi
+      ;;
+  esac
+  # A failed clone (another volume, no clonefile support) can leave a partial tree.
+  CLONE_MODE="plain copy"
+  rm -rf "$dst"
+  cp -a "$src" "$dst"
+}
+
+run_hook() {
+  local name=$1 cmd=$2 cwd=$3 slug=$4 dir=$5 branch=$6 drop=$7 rc=0
+  if [ -n "${WTC_NOTE:-}" ]; then
+    say "note: $WTC_NOTE"
+  fi
+  say "running $name hook in $cwd: $cmd"
+  (
+    cd "$cwd" &&
+      WT_SLUG=$slug WT_DIR=$dir WT_ROOT=$MAIN_ROOT WT_BRANCH=$branch WT_DROP_DATA=$drop bash -c "$cmd" >&2
+  ) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "$E_HOOK" "$name hook failed with exit code $rc (or $cwd is not accessible); the worktree is kept, fix the cause and run the same wt command again"
+  fi
+}
+
+# shellcheck disable=SC2154 # WTC_* are set by read_conf through printf -v
+materialize() {
+  local dir=$1 slug=$2 branch=$3 hooks=$4 entry src dst
+  load_wt_conf "$dir"
+  split_words "$WTC_clone"
+  for entry in ${WORDS[@]+"${WORDS[@]}"}; do
+    src="$MAIN_ROOT/$entry"
+    dst="$dir/$entry"
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      continue
+    fi
+    if [ ! -e "$src" ]; then
+      say "clone $entry: not in the main checkout, skipped"
+      continue
+    fi
+    mkdir -p "$(dirname "$dst")"
+    if ! clone_path "$src" "$dst"; then
+      die "$E_INTERNAL" "cloning $entry failed"
+    fi
+    say "cloned $entry ($CLONE_MODE)"
+  done
+  split_words "$WTC_copy"
+  for entry in ${WORDS[@]+"${WORDS[@]}"}; do
+    src="$MAIN_ROOT/$entry"
+    dst="$dir/$entry"
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      continue
+    fi
+    if [ ! -e "$src" ]; then
+      say "copy $entry: not in the main checkout, skipped"
+      continue
+    fi
+    mkdir -p "$(dirname "$dst")"
+    if [ -d "$src" ]; then
+      cp -R -p "$src" "$dst" || die "$E_INTERNAL" "copying $entry failed"
+    else
+      cp -p "$src" "$dst" || die "$E_INTERNAL" "copying $entry failed"
+    fi
+    say "copied $entry"
+  done
+  if [ "$hooks" = 1 ] && [ -n "$WTC_materialize" ]; then
+    run_hook materialize "$WTC_materialize" "$dir" "$slug" "$dir" "$branch" 0
+  fi
+}
+
+load_prs() {
+  PRS_LOADED=0
+  PRS=""
+  if [ "${WT_NO_GH:-}" = 1 ] || ! command -v gh >/dev/null 2>&1; then
+    return 0
+  fi
+  if PRS=$(cd "$MAIN_ROOT" && gh pr list --state all --limit 300 \
+    --json number,state,headRefName,headRefOid \
+    --jq '.[] | "\(.headRefName) \(.number) \(.state) \(.headRefOid)"' 2>/dev/null); then
+    PRS_LOADED=1
+  else
+    PRS=""
+  fi
+}
+
+# pr_lookup <branch>: sets PR_STATE (open|merged|closed|none|unknown), PR_NUM
+# and PR_HEAD. An open PR wins over a merged one, a merged one over a closed one.
+pr_lookup() {
+  PR_STATE=unknown
+  PR_NUM=""
+  PR_HEAD=""
+  if [ "$PRS_LOADED" != 1 ]; then
+    return 0
+  fi
+  PR_STATE=none
+  local head num state oid rank best=0
+  while read -r head num state oid; do
+    if [ "$head" != "$1" ]; then
+      continue
+    fi
+    case $state in
+      OPEN) rank=3 ;;
+      MERGED) rank=2 ;;
+      *) rank=1 ;;
+    esac
+    if [ "$rank" -gt "$best" ]; then
+      best=$rank
+      PR_NUM=$num
+      PR_HEAD=$oid
+      case $state in
+        OPEN) PR_STATE=open ;;
+        MERGED) PR_STATE=merged ;;
+        *) PR_STATE=closed ;;
+      esac
+    fi
+  done <<<"$PRS"
+  return 0
+}
+
+docker_enabled() {
+  [ "${WT_NO_DOCKER:-}" != 1 ] && command -v docker >/dev/null 2>&1
+}
+
+filter_prefix() {
+  local line
+  while IFS= read -r line; do
+    case $line in
+      "$1"*) printf '%s\n' "$line" ;;
+    esac
+  done <<<"$2"
+  return 0
+}
+
+# load_stacks [all]: STACKS_RUNNING (and STACKS_ALL) list compose projects named
+# <stack_prefix>*; STACKS_LOADED=1 when docker answered.
+load_stacks() {
+  STACKS_LOADED=0
+  STACKS_RUNNING=""
+  STACKS_ALL=""
+  local out
+  if [ -z "$REPO_stack_prefix" ] || ! docker_enabled; then
+    return 0
+  fi
+  out=$(docker compose ls -q 2>/dev/null) || return 0
+  STACKS_RUNNING=$(filter_prefix "$REPO_stack_prefix" "$out")
+  if [ "${1:-}" = all ]; then
+    out=$(docker compose ls -a -q 2>/dev/null) || return 0
+    STACKS_ALL=$(filter_prefix "$REPO_stack_prefix" "$out")
+  fi
+  STACKS_LOADED=1
+}
+
+has_line() {
+  local line
+  while IFS= read -r line; do
+    if [ "$line" = "$1" ]; then
+      return 0
+    fi
+  done <<<"$2"
+  return 1
+}
+
+count_lines() {
+  if [ -z "$1" ]; then
+    printf '0'
+  else
+    printf '%s\n' "$1" | wc -l | tr -d ' '
+  fi
+}
+
+worktree_status() {
+  local out
+  if out=$(GIT_OPTIONAL_LOCKS=0 git -C "$1" status --porcelain 2>/dev/null); then
+    if [ -n "$out" ]; then
+      DIRTY=yes
+    else
+      DIRTY=no
+    fi
+  else
+    DIRTY=unknown
+  fi
+}
+
+# ahead_behind <ref>: AB_AHEAD and AB_BEHIND against the local default branch.
+ahead_behind() {
+  AB_AHEAD=""
+  AB_BEHIND=""
+  local counts
+  if [ -z "$1" ] || ! git -C "$MAIN_ROOT" show-ref --verify --quiet "refs/heads/$DEFAULT_BRANCH"; then
+    return 0
+  fi
+  counts=$(git -C "$MAIN_ROOT" rev-list --left-right --count "refs/heads/$DEFAULT_BRANCH...$1" 2>/dev/null || true)
+  if [ -n "$counts" ]; then
+    AB_BEHIND=${counts%%[[:space:]]*}
+    AB_AHEAD=${counts##*[[:space:]]}
+  fi
+}
+
+# unmerged_count <ref>: UNMERGED = commits of <ref> in neither the local nor the
+# origin default branch; empty when that cannot be told.
+unmerged_count() {
+  UNMERGED=""
+  local base count
+  for base in "refs/heads/$DEFAULT_BRANCH" "refs/remotes/origin/$DEFAULT_BRANCH"; do
+    if ! git -C "$MAIN_ROOT" show-ref --verify --quiet "$base"; then
+      continue
+    fi
+    count=$(git -C "$MAIN_ROOT" rev-list --count "$base..$1" 2>/dev/null || true)
+    if [ -n "$count" ] && { [ -z "$UNMERGED" ] || [ "$count" -lt "$UNMERGED" ]; }; then
+      UNMERGED=$count
+    fi
+  done
+  return 0
+}
+
+worktree_ref() {
+  if [ -n "${WTS_BRANCH[$1]}" ]; then
+    printf 'refs/heads/%s' "${WTS_BRANCH[$1]}"
+  else
+    printf '%s' "${WTS_HEAD[$1]}"
+  fi
+}
+
+# idle_days_of <index>: IDLE_DAYS since the last git activity in the worktree.
+idle_days_of() {
+  local admin=${WTS_ADMIN[$1]} newest=0 t f
+  for f in "$admin/HEAD" "$admin/index" "$admin/logs/HEAD"; do
+    if [ -n "$admin" ] && [ -e "$f" ]; then
+      t=$(file_mtime "$f")
+      if [ "$t" -gt "$newest" ]; then
+        newest=$t
+      fi
+    fi
+  done
+  t=$(git -C "$MAIN_ROOT" log -1 --format=%ct "$(worktree_ref "$1")" 2>/dev/null || true)
+  if [ -n "$t" ] && [ "$t" -gt "$newest" ]; then
+    newest=$t
+  fi
+  IDLE_DAYS=$((($(date +%s) - newest) / 86400))
+}
+
+# --- commands --------------------------------------------------------------------
+
+cmd_new() {
+  local slug="" from="" branch="" branch_given=0 sync=0 hooks=1 dir i base sha
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --from)
+        need_value "$@"
+        from=$2
+        shift 2
+        ;;
+      --from=*)
+        from=${1#--from=}
+        shift
+        ;;
+      --branch)
+        need_value "$@"
+        branch=$2
+        branch_given=1
+        shift 2
+        ;;
+      --branch=*)
+        branch=${1#--branch=}
+        branch_given=1
+        shift
+        ;;
+      --sync)
+        sync=1
+        shift
+        ;;
+      --no-hooks)
+        hooks=0
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -*) die "$E_USAGE" "wt new: unknown option $1" ;;
+      *)
+        if [ -n "$slug" ]; then
+          die "$E_USAGE" "wt new: unexpected argument $1"
+        fi
+        slug=$1
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$slug" ]; then
+    die "$E_USAGE" "usage: wt new <slug> [--from <ref>] [--branch <name>] [--sync] [--no-hooks]"
+  fi
+  find_repo
+  check_slug "$slug"
+  if [ -z "$branch" ]; then
+    branch=$slug
+  fi
+  check_branch_name "$branch"
+  if [ -n "$from" ]; then
+    check_from "$from"
+  fi
+  if [ "$sync" = 1 ]; then
+    sync_default_branch
+  fi
+
+  if find_slug "$slug"; then
+    if [ "$FOUND_COUNT" -gt 1 ]; then
+      find_unique_slug "$slug"
+    fi
+    i=$FOUND
+    dir=${WTS_PATH[i]}
+    if [ ! -d "$dir" ]; then
+      die "$E_USAGE" "worktree '$slug' is registered at $dir but the directory is gone; run wt rm $slug first"
+    fi
+    if [ "$branch_given" = 1 ] && [ "${WTS_BRANCH[i]}" != "$branch" ]; then
+      die "$E_USAGE" "worktree '$slug' is on branch '${WTS_BRANCH[i]:-(detached)}', not '$branch'"
+    fi
+    if [ -n "$from" ]; then
+      say "worktree '$slug' already exists; --from ignored"
+    fi
+    branch=${WTS_BRANCH[i]}
+    if [ "${WTS_ADOPTED[i]}" = 0 ]; then
+      set_slug "$dir" "$slug" "$branch"
+    fi
+    say "reusing worktree '$slug' at $dir"
+  else
+    worktree_parent
+    dir="$WT_PARENT/.wt-$REPO_NAME-$slug"
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+      die "$E_USAGE" "$dir already exists but is not the worktree '$slug' of $MAIN_ROOT; move it away, or register it and run wt adopt"
+    fi
+    for ((i = 0; i < WTS_COUNT; i++)); do
+      if [ "${WTS_BRANCH[i]}" = "$branch" ]; then
+        die "$E_USAGE" "branch '$branch' is already checked out at ${WTS_PATH[i]}"
+      fi
+    done
+    if git -C "$MAIN_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+      if [ -n "$from" ]; then
+        die "$E_USAGE" "branch '$branch' already exists; --from only applies to a new branch"
+      fi
+      git_do -C "$MAIN_ROOT" worktree add --quiet "$dir" "$branch" || die "$E_INTERNAL" "git worktree add failed"
+      say "created worktree '$slug' at $dir on the existing branch '$branch'"
+    else
+      base=${from:-refs/heads/$DEFAULT_BRANCH}
+      if ! sha=$(git -C "$MAIN_ROOT" rev-parse --verify --quiet "$base^{commit}"); then
+        die "$E_USAGE" "cannot resolve the start point '$base'; pass --from <ref>"
+      fi
+      git_do -C "$MAIN_ROOT" worktree add --quiet -b "$branch" "$dir" "$sha" || die "$E_INTERNAL" "git worktree add failed"
+      say "created worktree '$slug' at $dir on the new branch '$branch' from ${from:-$DEFAULT_BRANCH} (${sha:0:12})"
+    fi
+    set_slug "$dir" "$slug" "$branch"
+  fi
+  materialize "$dir" "$slug" "$branch" "$hooks"
+  say "next: cd '$dir' (Claude Code: EnterWorktree with this path)"
+  printf '%s\n' "$dir"
+}
+
+cmd_ls() {
+  local json=0 i dir slug branch pr stack ab dirty missing sep=""
+  local w_slug=4 w_branch=6 w_pr=2
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json)
+        json=1
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *) die "$E_USAGE" "wt ls: unexpected argument $1" ;;
+    esac
+  done
+  find_repo
+  load_prs
+  load_stacks
+
+  LS_SLUG=()
+  LS_BRANCH=()
+  LS_AHEAD=()
+  LS_BEHIND=()
+  LS_DIRTY=()
+  LS_PR_NUM=()
+  LS_PR_STATE=()
+  LS_STACK=()
+  LS_PR_TEXT=()
+  for ((i = 1; i < WTS_COUNT; i++)); do
+    dir=${WTS_PATH[i]}
+    branch=${WTS_BRANCH[i]}
+    LS_SLUG[i]=${WTS_SLUG[i]}
+    LS_BRANCH[i]=$branch
+    ahead_behind "$(worktree_ref "$i")"
+    LS_AHEAD[i]=$AB_AHEAD
+    LS_BEHIND[i]=$AB_BEHIND
+    if [ -d "$dir" ]; then
+      worktree_status "$dir"
+      LS_DIRTY[i]=$DIRTY
+    else
+      LS_DIRTY[i]=missing
+    fi
+    if [ -n "$branch" ]; then
+      pr_lookup "$branch"
+    else
+      PR_STATE=none
+      PR_NUM=""
+    fi
+    LS_PR_STATE[i]=$PR_STATE
+    LS_PR_NUM[i]=$PR_NUM
+    if [ -z "$REPO_stack_prefix" ] || [ -z "${WTS_SLUG[i]}" ]; then
+      LS_STACK[i]=""
+    elif [ "$STACKS_LOADED" != 1 ]; then
+      LS_STACK[i]=unknown
+    elif has_line "$REPO_stack_prefix${WTS_SLUG[i]}" "$STACKS_RUNNING"; then
+      LS_STACK[i]=running
+    else
+      LS_STACK[i]=none
+    fi
+  done
+
+  if [ "$json" = 1 ]; then
+    printf '['
+    for ((i = 1; i < WTS_COUNT; i++)); do
+      printf '%s\n  {"slug": %s, "branch": %s, "path": %s, ' "$sep" \
+        "$(json_str_or_null "${LS_SLUG[i]}")" "$(json_str_or_null "${LS_BRANCH[i]}")" "$(json_str "${WTS_PATH[i]}")"
+      printf '"ahead": %s, "behind": %s, ' "$(json_num_or_null "${LS_AHEAD[i]}")" "$(json_num_or_null "${LS_BEHIND[i]}")"
+      case ${LS_DIRTY[i]} in
+        yes) dirty=true ;;
+        no) dirty=false ;;
+        *) dirty=null ;;
+      esac
+      case ${LS_PR_STATE[i]} in
+        open | merged | closed) pr="{\"number\": ${LS_PR_NUM[i]}, \"state\": \"${LS_PR_STATE[i]}\"}" ;;
+        *) pr=null ;;
+      esac
+      case ${LS_STACK[i]} in
+        running | none) stack="\"${LS_STACK[i]}\"" ;;
+        *) stack=null ;;
+      esac
+      if [ "${LS_DIRTY[i]}" = missing ]; then
+        missing=true
+      else
+        missing=false
+      fi
+      printf '"dirty": %s, "missing": %s, "pr": %s, "stack": %s}' "$dirty" "$missing" "$pr" "$stack"
+      sep=,
+    done
+    if [ -n "$sep" ]; then
+      printf '\n'
+    fi
+    printf ']\n'
+    return 0
+  fi
+
+  if [ "$WTS_COUNT" -le 1 ]; then
+    say "no linked worktrees in $MAIN_ROOT"
+    return 0
+  fi
+  for ((i = 1; i < WTS_COUNT; i++)); do
+    slug=${LS_SLUG[i]:--}
+    branch=${LS_BRANCH[i]:-(detached)}
+    case ${LS_PR_STATE[i]} in
+      open | merged | closed) pr="#${LS_PR_NUM[i]} ${LS_PR_STATE[i]}" ;;
+      none) pr=- ;;
+      *) pr='?' ;;
+    esac
+    LS_PR_TEXT[i]=$pr
+    if [ "${#slug}" -gt "$w_slug" ]; then w_slug=${#slug}; fi
+    if [ "${#branch}" -gt "$w_branch" ]; then w_branch=${#branch}; fi
+    if [ "${#pr}" -gt "$w_pr" ]; then w_pr=${#pr}; fi
+  done
+  printf '%-*s  %-*s  %-12s  %-7s  %-*s  %-7s  %s\n' "$w_slug" SLUG "$w_branch" BRANCH "AHEAD/BEHIND" DIRTY "$w_pr" PR STACK PATH
+  for ((i = 1; i < WTS_COUNT; i++)); do
+    if [ -n "${LS_AHEAD[i]}" ]; then
+      ab="+${LS_AHEAD[i]}/-${LS_BEHIND[i]}"
+    else
+      ab='?'
+    fi
+    case ${LS_STACK[i]} in
+      running) stack=running ;;
+      unknown) stack='?' ;;
+      *) stack=- ;;
+    esac
+    case ${LS_DIRTY[i]} in
+      unknown) dirty='?' ;;
+      *) dirty=${LS_DIRTY[i]} ;;
+    esac
+    printf '%-*s  %-*s  %-12s  %-7s  %-*s  %-7s  %s\n' "$w_slug" "${LS_SLUG[i]:--}" "$w_branch" "${LS_BRANCH[i]:-(detached)}" \
+      "$ab" "$dirty" "$w_pr" "${LS_PR_TEXT[i]}" "$stack" "${WTS_PATH[i]}"
+  done
+}
+
+cmd_path() {
+  case ${1:-} in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+  if [ $# -ne 1 ]; then
+    die "$E_USAGE" "usage: wt path <slug>"
+  fi
+  find_repo
+  check_slug_format "$1"
+  find_unique_slug "$1"
+  printf '%s\n' "${WTS_PATH[FOUND]}"
+}
+
+cmd_adopt() {
+  case ${1:-} in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+  if [ $# -ne 2 ]; then
+    die "$E_USAGE" "usage: wt adopt <dir> <slug>"
+  fi
+  local target=$1 slug=$2 real i index=-1
+  find_repo
+  check_slug "$slug"
+  if [ ! -d "$target" ]; then
+    die "$E_USAGE" "$target is not a directory"
+  fi
+  real=$(cd "$target" && pwd -P)
+  for ((i = 0; i < WTS_COUNT; i++)); do
+    if [ "$(real_dir "${WTS_PATH[i]}")" = "$real" ]; then
+      index=$i
+    fi
+  done
+  if [ "$index" -eq 0 ]; then
+    die "$E_USAGE" "$real is the main checkout; only linked worktrees get a slug"
+  fi
+  if [ "$index" -lt 0 ]; then
+    die "$E_USAGE" "$real is not a registered worktree of $MAIN_ROOT (see git worktree list)"
+  fi
+  for ((i = 1; i < WTS_COUNT; i++)); do
+    if [ "$i" -ne "$index" ] && [ "${WTS_SLUG[i]}" = "$slug" ]; then
+      die "$E_USAGE" "slug '$slug' is already used by ${WTS_PATH[i]}"
+    fi
+  done
+  set_slug "${WTS_PATH[index]}" "$slug" "${WTS_BRANCH[index]}"
+  say "adopted ${WTS_PATH[index]} as '$slug'"
+  printf '%s\n' "${WTS_PATH[index]}"
+}
+
+# shellcheck disable=SC2154 # WTC_* are set by read_conf through printf -v
+cmd_rm() {
+  local slug="" force=0 drop=0 keep_branch=0 hooks=1
+  local i dir branch own present=0 here reasons="" cwd="" sha ref teardown hint
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --force) force=1 ;;
+      --drop-data) drop=1 ;;
+      --keep-branch) keep_branch=1 ;;
+      --no-hooks) hooks=0 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -*) die "$E_USAGE" "wt rm: unknown option $1" ;;
+      *)
+        if [ -n "$slug" ]; then
+          die "$E_USAGE" "wt rm: unexpected argument $1"
+        fi
+        slug=$1
+        ;;
+    esac
+    shift
+  done
+  if [ -z "$slug" ]; then
+    die "$E_USAGE" "usage: wt rm <slug> [--force] [--drop-data] [--keep-branch] [--no-hooks]"
+  fi
+  find_repo
+  check_slug_format "$slug"
+  find_unique_slug "$slug"
+  i=$FOUND
+  dir=${WTS_PATH[i]}
+  branch=${WTS_BRANCH[i]}
+  own=${WTS_OWN_BRANCH[i]:-$branch}
+  if [ "${WTS_LOCKED[i]}" = 1 ]; then
+    die "$E_REFUSED" "worktree '$slug' is locked; if it may go, unlock it first: git worktree unlock '$dir'"
+  fi
+  if [ -d "$dir" ]; then
+    present=1
+    here=$(pwd -P)
+    case "$here/" in
+      "$(real_dir "$dir")"/*) die "$E_REFUSED" "you are inside $dir; run wt rm from the main checkout ($MAIN_ROOT)" ;;
+    esac
+    worktree_status "$dir"
+    case $DIRTY in
+      yes) reasons="$reasons; it has uncommitted or untracked changes" ;;
+      unknown) reasons="$reasons; git status failed in it" ;;
+    esac
+    if [ -f "$dir/.gitmodules" ] && git -C "$dir" submodule status 2>/dev/null | grep -q '^[^-]'; then
+      reasons="$reasons; it has checked-out submodules"
+    fi
+  fi
+
+  ref=$(worktree_ref "$i")
+  PR_STATE=none
+  PR_NUM=""
+  PR_HEAD=""
+  if [ -n "$branch" ]; then
+    load_prs
+    pr_lookup "$branch"
+  fi
+  if [ "$PR_STATE" = merged ] && [ -z "$PR_HEAD" ]; then
+    PR_STATE=unknown
+  fi
+  unmerged_count "$ref"
+  if [ "$PR_STATE" = open ]; then
+    reasons="$reasons; PR #$PR_NUM is open"
+  fi
+  if [ "$PR_STATE" = merged ] && [ "$(git -C "$MAIN_ROOT" rev-parse "$ref" 2>/dev/null || true)" != "$PR_HEAD" ]; then
+    reasons="$reasons; '$branch' has commits after merged PR #$PR_NUM"
+  elif [ "$PR_STATE" != merged ]; then
+    if [ -z "$UNMERGED" ]; then
+      reasons="$reasons; cannot tell whether ${branch:-its HEAD} is merged into $DEFAULT_BRANCH"
+    elif [ "$UNMERGED" -gt 0 ]; then
+      if [ "$PR_STATE" = unknown ]; then
+        reasons="$reasons; ${branch:-its HEAD} has $UNMERGED commit(s) not in $DEFAULT_BRANCH (no PR data from gh)"
+      else
+        reasons="$reasons; ${branch:-its HEAD} has $UNMERGED commit(s) not in $DEFAULT_BRANCH and no merged PR"
+      fi
+    fi
+  fi
+
+  teardown=""
+  if [ "$hooks" = 1 ]; then
+    if [ "$present" = 1 ]; then
+      load_wt_conf "$dir"
+      cwd=$dir
+    else
+      read_conf "$MAIN_ROOT/.wt.conf" WTC
+      WTC_NOTE=""
+      cwd=$MAIN_ROOT
+    fi
+    teardown=$WTC_teardown
+    if [ "$present" = 0 ] && [ -n "$teardown" ]; then
+      reasons="$reasons; its directory is gone, so the teardown hook would run in the main checkout, where it must take the slug from WT_SLUG"
+    fi
+  fi
+  if [ -n "$reasons" ] && [ "$force" = 0 ]; then
+    hint="Use --force to remove it anyway."
+    if [ "$present" = 0 ]; then
+      hint="$hint Or use --no-hooks to only unregister it${REPO_stack_prefix:+ and stop the stack $REPO_stack_prefix$slug by hand}."
+    fi
+    die "$E_REFUSED" "refusing to remove '$slug': ${reasons#; }. $hint"
+  fi
+
+  if [ -n "$teardown" ]; then
+    run_hook teardown "$teardown" "$cwd" "$slug" "$dir" "$branch" "$drop"
+  fi
+
+  if [ "$force" = 1 ]; then
+    git_do -C "$MAIN_ROOT" worktree remove --force "$dir" || die "$E_INTERNAL" "git worktree remove failed"
+  else
+    git_do -C "$MAIN_ROOT" worktree remove "$dir" || die "$E_INTERNAL" "git worktree remove failed"
+  fi
+
+  if [ -n "$branch" ] && [ "$keep_branch" = 0 ] && [ "$branch" != "$DEFAULT_BRANCH" ]; then
+    if [ "$branch" != "$own" ]; then
+      say "kept branch '$branch': the worktree had it checked out, but the branch wt created or adopted for it is '$own' (kept too)"
+    elif sha=$(git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/heads/$branch"); then
+      git_do -C "$MAIN_ROOT" branch -D --quiet "$branch" || die "$E_INTERNAL" "cannot delete the branch '$branch'"
+      say "deleted local branch '$branch' (was ${sha:0:12}; restore with: git branch $branch ${sha:0:12})"
+    fi
+  fi
+  say "removed worktree '$slug' ($dir)"
+}
+
+add_finding() {
+  F_LEVEL+=("$1")
+  F_KIND+=("$2")
+  F_SUBJECT+=("$3")
+  F_HINT+=("$4")
+}
+
+cmd_doctor() {
+  local json=0 idle="" i ref name low remote shadow adopted=0 running_count="" name_slug volume rest
+  local remote_sha local_sha behind issues=0 sep="" out
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json)
+        json=1
+        shift
+        ;;
+      --idle-days)
+        need_value "$@"
+        idle=$2
+        shift 2
+        ;;
+      --idle-days=*)
+        idle=${1#--idle-days=}
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *) die "$E_USAGE" "wt doctor: unexpected argument $1" ;;
+    esac
+  done
+  case $idle in
+    '') ;;
+    *[!0-9]*) die "$E_USAGE" "--idle-days must be a whole number" ;;
+    *) idle=$((10#$idle)) ;;
+  esac
+  find_repo
+  if [ -z "$idle" ]; then
+    idle=${REPO_idle_days:-7}
+  fi
+  F_LEVEL=()
+  F_KIND=()
+  F_SUBJECT=()
+  F_HINT=()
+
+  while IFS= read -r ref; do
+    name=${ref#refs/heads/}
+    low=$(lower "$name")
+    shadow=0
+    case $low in
+      refs/* | head) shadow=1 ;;
+    esac
+    for remote in ${REMOTES[@]+"${REMOTES[@]}"}; do
+      case $low in
+        "$(lower "$remote")"/*) shadow=1 ;;
+      esac
+    done
+    if [ "$shadow" = 1 ]; then
+      add_finding problem shadow-ref "$ref" "a local branch that shadows a remote or ref name (names compare case-insensitively on macOS); rename it: git branch -m '$name' <plain-name>"
+    fi
+  done < <(git -C "$MAIN_ROOT" for-each-ref --format='%(refname)' refs/heads/)
+
+  load_prs
+  for ((i = 1; i < WTS_COUNT; i++)); do
+    if [ -n "${WTS_SLUG[i]}" ]; then
+      find_slug "${WTS_SLUG[i]}"
+      if [ "$FOUND_COUNT" -gt 1 ] && [ "$FOUND" -eq "$i" ]; then
+        add_finding problem duplicate-slug "${WTS_SLUG[i]}" "$FOUND_COUNT worktrees share this slug, so wt refuses to act on it; give each its own: wt adopt <dir> <slug>"
+      fi
+    fi
+    if [ ! -d "${WTS_PATH[i]}" ]; then
+      add_finding problem stale-registration "${WTS_PATH[i]}" "the directory is gone: wt rm ${WTS_SLUG[i]:-<slug>} --no-hooks only unregisters it (then clean up its stack by hand); --force runs the teardown hook from the main checkout"
+      continue
+    fi
+    if [ -z "${WTS_SLUG[i]}" ]; then
+      if [ -n "${WTS_COPIED_FROM[i]}" ]; then
+        add_finding action unadopted "${WTS_PATH[i]}" "its wt.slug was copied from ${WTS_COPIED_FROM[i]} by git worktree add and is ignored; give it its own: wt adopt '${WTS_PATH[i]}' <slug>"
+      else
+        add_finding action unadopted "${WTS_PATH[i]}" "wt adopt '${WTS_PATH[i]}' <slug>"
+      fi
+      continue
+    fi
+    if [ "${WTS_ADOPTED[i]}" = 1 ]; then
+      adopted=$((adopted + 1))
+    fi
+    if [ -z "${WTS_BRANCH[i]}" ] || [ "$PRS_LOADED" != 1 ]; then
+      continue
+    fi
+    pr_lookup "${WTS_BRANCH[i]}"
+    if [ "$PR_STATE" != merged ] || [ "$(git -C "$MAIN_ROOT" rev-parse "refs/heads/${WTS_BRANCH[i]}" 2>/dev/null || true)" != "$PR_HEAD" ]; then
+      continue
+    fi
+    worktree_status "${WTS_PATH[i]}"
+    if [ "$DIRTY" != no ]; then
+      continue
+    fi
+    idle_days_of "$i"
+    if [ "$IDLE_DAYS" -ge "$idle" ]; then
+      add_finding action cleanup-candidate "${WTS_SLUG[i]}" "PR #$PR_NUM merged, clean, idle $IDLE_DAYS days: wt rm ${WTS_SLUG[i]}"
+    fi
+  done
+  if [ "$PRS_LOADED" != 1 ] && [ "$WTS_COUNT" -gt 1 ]; then
+    add_finding info cleanup-check "-" "skipped: no PR data from gh (not installed, not logged in, no GitHub remote, or WT_NO_GH=1)"
+  fi
+
+  load_stacks all
+  if [ -n "$REPO_stack_prefix" ] && [ "$STACKS_LOADED" != 1 ]; then
+    add_finding info stacks "-" "skipped: docker is not available (or WT_NO_DOCKER=1)"
+  elif [ "$STACKS_LOADED" = 1 ]; then
+    running_count=$(count_lines "$STACKS_RUNNING")
+    if [ -n "$REPO_stack_budget" ] && [ "$running_count" -gt "$REPO_stack_budget" ]; then
+      add_finding problem stack-budget "$REPO_stack_prefix*" "$running_count stacks running, budget $REPO_stack_budget; stop some: $(printf '%s' "$STACKS_RUNNING" | tr '\n' ' ')"
+    fi
+    while IFS= read -r name; do
+      if [ -z "$name" ]; then
+        continue
+      fi
+      name_slug=${name#"$REPO_stack_prefix"}
+      if ! find_slug "$name_slug"; then
+        add_finding problem orphan-stack "$name" "no worktree '$name_slug'; stop it: docker compose -p $name down"
+      fi
+    done <<<"$STACKS_ALL"
+    if out=$(docker volume ls -q 2>/dev/null); then
+      while IFS= read -r volume; do
+        if [ -z "$volume" ]; then
+          continue
+        fi
+        rest=${volume#"$REPO_stack_prefix"}
+        name_slug=${rest%%_*}
+        if ! find_slug "$name_slug"; then
+          add_finding action orphan-volume "$volume" "no worktree '$name_slug'; its data can be deleted with: docker volume rm $volume"
+        fi
+      done < <(filter_prefix "$REPO_stack_prefix" "$out")
+    fi
+  fi
+
+  if git -C "$MAIN_ROOT" remote get-url origin >/dev/null 2>&1; then
+    remote_sha=$(GIT_TERMINAL_PROMPT=0 git -C "$MAIN_ROOT" ls-remote origin "refs/heads/$DEFAULT_BRANCH" 2>/dev/null | cut -f1 || true)
+    local_sha=$(git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH" 2>/dev/null || true)
+    if [ -n "$remote_sha" ] && [ "$remote_sha" != "$local_sha" ]; then
+      add_finding info origin-stale "origin/$DEFAULT_BRANCH" "the remote moved since the last fetch; git fetch origin (or wt new <slug> --sync)"
+    fi
+    if [ -n "$local_sha" ] && git -C "$MAIN_ROOT" show-ref --verify --quiet "refs/heads/$DEFAULT_BRANCH"; then
+      behind=$(git -C "$MAIN_ROOT" rev-list --count "refs/heads/$DEFAULT_BRANCH..refs/remotes/origin/$DEFAULT_BRANCH" 2>/dev/null || true)
+      if [ -n "$behind" ] && [ "$behind" -gt 0 ]; then
+        add_finding info default-behind "$DEFAULT_BRANCH" "$behind commit(s) behind origin/$DEFAULT_BRANCH; new worktrees branch from the local one (wt new <slug> --sync)"
+      fi
+    fi
+  fi
+
+  for ((i = 0; i < ${#F_LEVEL[@]}; i++)); do
+    if [ "${F_LEVEL[i]}" != info ]; then
+      issues=$((issues + 1))
+    fi
+  done
+
+  if [ "$json" = 1 ]; then
+    printf '{"repo": %s, "default_branch": %s, "worktrees": %s, "adopted": %s, ' \
+      "$(json_str "$MAIN_ROOT")" "$(json_str "$DEFAULT_BRANCH")" "$((WTS_COUNT - 1))" "$adopted"
+    printf '"stacks_running": %s, "stack_budget": %s, "issues": %s, "findings": [' \
+      "$(json_num_or_null "$running_count")" "$(json_num_or_null "$REPO_stack_budget")" "$issues"
+    for ((i = 0; i < ${#F_LEVEL[@]}; i++)); do
+      printf '%s\n  {"level": %s, "kind": %s, "subject": %s, "hint": %s}' "$sep" \
+        "$(json_str "${F_LEVEL[i]}")" "$(json_str "${F_KIND[i]}")" "$(json_str "${F_SUBJECT[i]}")" "$(json_str "${F_HINT[i]}")"
+      sep=,
+    done
+    if [ -n "$sep" ]; then
+      printf '\n'
+    fi
+    printf ']}\n'
+  else
+    printf 'wt doctor: %s (default branch %s)\n' "$MAIN_ROOT" "$DEFAULT_BRANCH"
+    printf '  worktrees: %s linked, %s with a wt slug' "$((WTS_COUNT - 1))" "$adopted"
+    if [ -n "$running_count" ]; then
+      printf '; stacks running: %s%s' "$running_count" "${REPO_stack_budget:+ of $REPO_stack_budget}"
+    fi
+    printf '\n'
+    for ((i = 0; i < ${#F_LEVEL[@]}; i++)); do
+      printf '  %-7s  %-18s  %s\n' "${F_LEVEL[i]}" "${F_KIND[i]}" "${F_SUBJECT[i]}"
+      printf '           %s\n' "${F_HINT[i]}"
+    done
+    if [ "$issues" -eq 0 ]; then
+      printf '  nothing to act on\n'
+    fi
+  fi
+  if [ "$issues" -gt 0 ]; then
+    die "$E_FINDINGS" "doctor found $issues issue(s)"
+  fi
+}
+
+main() {
+  local cmd=${1:-}
+  if [ $# -gt 0 ]; then
+    shift
+  fi
+  case $cmd in
+    new) cmd_new "$@" ;;
+    ls) cmd_ls "$@" ;;
+    path) cmd_path "$@" ;;
+    adopt) cmd_adopt "$@" ;;
+    rm) cmd_rm "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    help | -h | --help) usage ;;
+    version | --version) printf 'wt %s\n' "$WT_VERSION" ;;
+    '')
+      usage >&2
+      WT_DYING=1
+      exit "$E_USAGE"
+      ;;
+    *) die "$E_USAGE" "unknown command '$cmd' (see wt help)" ;;
+  esac
+}
+
+main "$@"
