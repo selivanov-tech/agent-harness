@@ -80,4 +80,4 @@ The practices come from the multi-session workflow of an earlier project (siblin
 
 ## See also
 
-[LifeOS Lite](https://github.com/selivanov-tech/lifeos-lite) — a companion project: a personal assistant profile for Hermes that keeps goals, weekly reviews, workouts and a journal in plain Markdown files (Russian, Windows installer). The same idea of keeping state in files that the agent reads on demand, applied to a personal operating system instead of a codebase.
+[LifeOS Lite](https://github.com/selivanov-tech/lifeos-lite) — a companion project: a personal assistant profile for Hermes that keeps goals, weekly reviews, workouts and a journal in plain Markdown files (Russian, cross-platform installer). The same idea of keeping state in files that the agent reads on demand, applied to a personal operating system instead of a codebase.
